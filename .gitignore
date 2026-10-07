@@ -4,3 +4,18 @@ Release/
 
 # CubeIDE local artifacts
 *.launch
+
+# Renode / Robot Framework test artifacts
+robot_output.xml
+log.html
+report.html
+logs/
+snapshots/
+
+# Host application (Python) artifacts
+host_app/.venv/
+host_app/models/
+host_app/tmp/
+__pycache__/
+*.pyc
+.pytest_cache/

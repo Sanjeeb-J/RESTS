@@ -21,7 +21,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -31,7 +31,8 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define RESTS_RX_RING_SIZE 128U
+#define RESTS_COMMAND_SIZE 96U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -40,11 +41,18 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
-
 UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
-
+static uint8_t usart1_rx_byte;
+static volatile uint16_t usart1_rx_head;
+static volatile uint16_t usart1_rx_tail;
+static volatile uint8_t usart1_rx_overflow;
+static volatile uint8_t usart1_error;
+static volatile uint8_t usart1_rx_ring[RESTS_RX_RING_SIZE];
+static char rests_command[RESTS_COMMAND_SIZE];
+static uint16_t rests_command_length;
+static uint8_t rests_command_overflow;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -52,12 +60,140 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART1_UART_Init(void);
 /* USER CODE BEGIN PFP */
-
+static void USART1_StartReceive(void);
+static void RESTS_ProcessRx(void);
+static void RESTS_ProcessByte(uint8_t byte);
+static void RESTS_HandleCommand(const char *command);
+static void RESTS_Send(const char *message);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static void USART1_StartReceive(void)
+{
+  if ((usart1_error == 0U) &&
+      (HAL_UART_Receive_IT(&huart1, &usart1_rx_byte, 1U) != HAL_OK))
+  {
+    usart1_error = 1U;
+  }
+}
 
+static void RESTS_Send(const char *message)
+{
+  uint16_t length = (uint16_t)strlen(message);
+
+  if (HAL_UART_Transmit(&huart1, (uint8_t *)message, length, 100U) != HAL_OK)
+  {
+    usart1_error = 1U;
+  }
+}
+
+static void RESTS_HandleCommand(const char *command)
+{
+  const char *separator;
+
+  if (strcmp(command, "HELLO?") == 0)
+  {
+    RESTS_Send("RESTS/1 READY MCU=STM32F429ZI\r\n");
+  }
+  else if (strcmp(command, "PING") == 0)
+  {
+    RESTS_Send("PONG\r\n");
+  }
+  else if (strcmp(command, "PTT:BEGIN") == 0)
+  {
+    RESTS_Send("ACK:PTT:BEGIN\r\n");
+  }
+  else if (strcmp(command, "PTT:END") == 0)
+  {
+    RESTS_Send("ACK:PTT:END\r\n");
+  }
+  else if (strncmp(command, "LANG:", 5U) == 0)
+  {
+    separator = strchr(command + 5, ':');
+    if ((separator != NULL) && (separator != command + 5) &&
+        (separator[1] != '\0') && (strchr(separator + 1, ':') == NULL))
+    {
+      RESTS_Send("ACK:LANG\r\n");
+    }
+    else
+    {
+      RESTS_Send("ERR:BAD_LANG\r\n");
+    }
+  }
+  else
+  {
+    RESTS_Send("ERR:UNKNOWN_CMD\r\n");
+  }
+}
+
+static void RESTS_ProcessByte(uint8_t byte)
+{
+  if ((byte == (uint8_t)'\r') || (byte == (uint8_t)'\n'))
+  {
+    if (rests_command_overflow != 0U)
+    {
+      RESTS_Send("ERR:LINE_TOO_LONG\r\n");
+    }
+    else if (rests_command_length != 0U)
+    {
+      rests_command[rests_command_length] = '\0';
+      RESTS_HandleCommand(rests_command);
+    }
+
+    rests_command_length = 0U;
+    rests_command_overflow = 0U;
+    return;
+  }
+
+  if (rests_command_overflow == 0U)
+  {
+    if (rests_command_length < (RESTS_COMMAND_SIZE - 1U))
+    {
+      rests_command[rests_command_length] = (char)byte;
+      rests_command_length++;
+    }
+    else
+    {
+      rests_command_overflow = 1U;
+    }
+  }
+}
+
+static void RESTS_ProcessRx(void)
+{
+  if ((usart1_error != 0U) && (huart1.RxState == HAL_UART_STATE_READY))
+  {
+    usart1_error = 0U;
+    USART1_StartReceive();
+  }
+
+  if (usart1_rx_overflow != 0U)
+  {
+    __disable_irq();
+    usart1_rx_tail = usart1_rx_head;
+    usart1_rx_overflow = 0U;
+    __enable_irq();
+
+    rests_command_length = 0U;
+    rests_command_overflow = 0U;
+    RESTS_Send("ERR:RX_OVERFLOW\r\n");
+  }
+
+  while (usart1_rx_tail != usart1_rx_head)
+  {
+    uint16_t tail = usart1_rx_tail;
+    uint8_t byte = usart1_rx_ring[tail];
+
+    tail++;
+    if (tail >= RESTS_RX_RING_SIZE)
+    {
+      tail = 0U;
+    }
+    usart1_rx_tail = tail;
+    RESTS_ProcessByte(byte);
+  }
+}
 /* USER CODE END 0 */
 
 /**
@@ -91,7 +227,7 @@ int main(void)
   MX_GPIO_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-
+  USART1_StartReceive();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -101,6 +237,7 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    RESTS_ProcessRx();
   }
   /* USER CODE END 3 */
 }
@@ -116,17 +253,15 @@ void SystemClock_Config(void)
 
   /** Configure the main internal regulator output voltage
   */
-  if (HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE4) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);
 
-  /** Initializes the CPU, AHB and APB buses clocks
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_MSI;
-  RCC_OscInitStruct.MSIState = RCC_MSI_ON;
-  RCC_OscInitStruct.MSICalibrationValue = RCC_MSICALIBRATION_DEFAULT;
-  RCC_OscInitStruct.MSIClockRange = RCC_MSIRANGE_4;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
@@ -136,13 +271,11 @@ void SystemClock_Config(void)
   /** Initializes the CPU, AHB and APB buses clocks
   */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
-                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2
-                              |RCC_CLOCKTYPE_PCLK3;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_MSI;
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
-  RCC_ClkInitStruct.APB3CLKDivider = RCC_HCLK_DIV1;
 
   if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
   {
@@ -173,22 +306,7 @@ static void MX_USART1_UART_Init(void)
   huart1.Init.Mode = UART_MODE_TX_RX;
   huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
   huart1.Init.OverSampling = UART_OVERSAMPLING_16;
-  huart1.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
-  huart1.Init.ClockPrescaler = UART_PRESCALER_DIV1;
-  huart1.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
   if (HAL_UART_Init(&huart1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_UARTEx_SetTxFifoThreshold(&huart1, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_UARTEx_SetRxFifoThreshold(&huart1, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_UARTEx_DisableFifoMode(&huart1) != HAL_OK)
   {
     Error_Handler();
   }
@@ -218,12 +336,43 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if ((huart->Instance == USART1) && (usart1_error == 0U))
+  {
+    uint16_t head = usart1_rx_head;
+    uint16_t next = head + 1U;
 
+    if (next >= RESTS_RX_RING_SIZE)
+    {
+      next = 0U;
+    }
+
+    if (next != usart1_rx_tail)
+    {
+      usart1_rx_ring[head] = usart1_rx_byte;
+      usart1_rx_head = next;
+    }
+    else
+    {
+      usart1_rx_overflow = 1U;
+    }
+
+    USART1_StartReceive();
+  }
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART1)
+  {
+    usart1_error = 1U;
+  }
+}
 /* USER CODE END 4 */
 
 /**
   * @brief  This function is executed in case of error occurrence.
-  * @param None
   * @retval None
   */
 void Error_Handler(void)

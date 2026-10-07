@@ -1,0 +1,28 @@
+:name: RESTS STM32F429 UART bridge
+:description: Loads the RESTS Debug ELF on an STM32F429ZITx and exposes sysbus.usart1 as a TCP socket terminal on 127.0.0.1:12345 for the host_app client.
+
+# ---------------------------------------------------------------------------
+# The '@' prefix makes Renode resolve the path against its working directory;
+# a plain relative string ("./Debug/...") is rejected by LoadELF. Run Renode
+# from the repository root (launch_renode.ps1 does this) or override $elf with
+# an absolute path: $elf?=@D:/path/to/RESTS_STM32.elf
+# ---------------------------------------------------------------------------
+$elf?=@./Debug/RESTS_STM32.elf
+$port?=12345
+
+using sysbus
+
+mach create "rests-f429"
+machine LoadPlatformDescription @platforms/cpus/stm32f429.repl
+sysbus LoadELF $elf
+
+# Expose the emulated USART1 as a TCP server. host_app connects to
+# 127.0.0.1:12345 and speaks the RESTS protocol (HELLO?, LANG:.., PTT:*).
+# NOTE: Renode binds this to all interfaces (0.0.0.0), not just loopback.
+emulation CreateServerSocketTerminal $port "term" false
+connector Connect sysbus.usart1 term
+
+# Useful while debugging the protocol:
+# showAnalyzer usart1
+
+start

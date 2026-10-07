@@ -1,0 +1,23 @@
+# RESTS host application - runtime dependencies (Python 3.11, Windows)
+#
+# Everything here runs locally: no cloud API is used at any point.
+
+# Audio capture (PortAudio) - microphone input for push-to-talk
+sounddevice>=0.4.6
+numpy>=1.26
+
+# Speech recognition: multilingual faster-whisper (local checkpoints)
+faster-whisper>=1.0.3
+
+# Translation: facebook/nllb-200-distilled-600M (local, CC-BY-NC 4.0!)
+transformers>=4.40.0
+sentencepiece>=0.1.99
+sacremoses>=0.1.1
+huggingface_hub>=0.23.0
+
+# CPU wheels by default. For an NVIDIA GPU install a CUDA build instead:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+torch>=2.2.0
+
+# Optional spoken output through installed Windows (SAPI) voices
+pywin32>=306 ; sys_platform == "win32"

@@ -1,0 +1,3 @@
+# Test-only dependencies (host_app/setup.ps1 installs this as well;
+# use -DevOnly to install just these for running the automated tests)
+pytest>=8.0
