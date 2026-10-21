@@ -589,6 +589,11 @@ class RestsApp(tk.Tk):
     def _start_ptt(self) -> None:
         if self._recording:
             return
+        if not self.uart.is_ready:
+            message = "Connect to Renode first; audio must pass through the STM32 relay."
+            self._set_status(message, "error", transient=False)
+            self._show_notice(message, "error")
+            return
         try:
             self.recorder.start()
         except RecorderError as exc:
@@ -691,6 +696,13 @@ class RestsApp(tk.Tk):
             samples, source, target = job
             self._post(("busy", True))
             try:
+                def relay_audio(samples):
+                    seconds = len(samples) / float(self.config_obj.sample_rate)
+                    self._post_status(
+                        f"relaying {seconds:.1f}s audio through STM32...", "info"
+                    )
+                    return self.uart.relay_audio(samples)
+
                 result = process_recording(
                     samples,
                     self.asr,
@@ -698,6 +710,7 @@ class RestsApp(tk.Tk):
                     source,
                     target,
                     sample_rate=self.config_obj.sample_rate,
+                    audio_relay=relay_audio,
                 )
             except Exception as exc:  # pragma: no cover - defensive
                 result = ProcessingResult(
@@ -713,10 +726,15 @@ class RestsApp(tk.Tk):
                     and self._speech_enabled
                 ):
                     status = self.speech.speak(result.translated_text, target)
-                    if not status.available:
-                        self._post(("speech", status))
-            except Exception:  # best-effort TTS, never kill the worker
-                pass
+                    if status.available:
+                        status = SpeechStatus(
+                            True,
+                            f"spoken output: {status.voice or 'Windows voice'}",
+                            status.voice,
+                        )
+                    self._post(("speech", status))
+            except Exception as exc:  # best-effort TTS, never kill the worker
+                self._post(("speech", SpeechStatus(False, f"speech failed: {exc}")))
             self._post(("busy", False))
 
     # ------------------------------------------------------------ queue/ UI

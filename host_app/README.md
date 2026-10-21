@@ -1,17 +1,19 @@
 # RESTS host application
 
-Windows desktop application for the RESTS STM32F429 UART project: it
-records speech with the laptop microphone, transcribes and translates it
-entirely on-device, shows always-visible captions and drives the emulated
-firmware over UART (via Renode's TCP socket) with push-to-talk control.
+Windows desktop application for the RESTS STM32F429 project. It records
+speech with the laptop microphone, compresses and sends the audio through
+Renode and the emulated STM32 UART relay, then transcribes and translates
+the returned audio locally. Source and translated captions remain visible.
 
 ```
-microphone ──► faster-whisper (local) ──► captions (source)
-                         │
-                         ▼
-               NLLB-200 (local)  ──► captions (translation) ──► optional Windows TTS
-                         │
-UART  ◄──── Renode 127.0.0.1:12345 ──── HELLO? / LANG:.. / PTT:BEGIN / PTT:END
+microphone ──► ADPCM frames ──► Renode TCP ──► STM32 USART1 relay
+     ▲                                             │
+     └──────────────── returned audio ────────────┘
+     │
+     └──► faster-whisper (local) ──► transcript ──► NLLB-200 (local)
+                                                   └──► captions / optional TTS
+
+Control UART: HELLO? / PING / LANG / PTT commands and acknowledgements
 ```
 
 Nothing leaves the machine: there is **no cloud service, no telemetry and
@@ -94,6 +96,8 @@ Handy switches: `-Headless` (no GUI), `-ElfPath <file>` (custom ELF),
 
 The host application connects as a **TCP client** to `127.0.0.1:12345`.
 If Renode is not running the UI simply shows `error - connect failed`.
+Push-to-talk is enabled only while the Renode firmware link is ready, because
+the audio must complete the STM32 relay before recognition.
 
 ## 4. Run the application
 
@@ -129,8 +133,10 @@ Useful flags (forwarded to `python -m rests_host`):
    the 95 languages - see §7.
 2. Press and **hold** the *HOLD TO TALK* button or the **F9** key
    (`RESTS_PTT_KEY`), speak, then release.
-3. The source transcript and the translated caption appear immediately and
-   stay on screen. The next hold replaces them.
+3. The app sends compact IMA ADPCM audio blocks in sequenced, CRC-checked
+   frames through Renode and the STM32F429 USART1 relay. It checks the
+   returned frames, rebuilds the audio, then runs Faster-Whisper and NLLB
+   on the laptop. The source transcript and translated caption stay visible.
 
 The window keeps a **700x660** minimum so every section stays readable: the
 translated caption gets about two thirds of the caption area, the status bar
@@ -219,7 +225,11 @@ Japanese only, so e.g. Malayalam shows
 
 Captions keep working either way; add voices via
 *Settings > Time & Language > Speech* (or the "Add a voice" link in
-Windows). Disable spoken output with the checkbox or `RESTS_SPEECH=0`.
+Windows). The current verified computer detects English, Japanese, and
+Korean voices; Hindi and Malayalam remain captions-only until matching
+Windows voices are installed. After each translation the status line shows
+the voice used, or the reason speech could not run. Disable spoken output
+with the checkbox or `RESTS_SPEECH=0`.
 
 ## 8. Tests
 
@@ -227,11 +237,11 @@ Windows). Disable spoken output with the checkbox or `RESTS_SPEECH=0`.
 powershell -ExecutionPolicy Bypass -File host_app\test.ps1
 ```
 
-Focused tests with fake devices (no microphone, no Renode, no models):
-protocol framing/handshake against a fake UART socket device, PTT command
-order, the 95-language mapping, translation-service interfaces, CUDA
-error detection with the automatic CPU fallback, audio/temp-file cleanup
-and voice matching.
+Focused tests with fake devices (no microphone, no Renode, no models) cover
+audio packet and codec handling, UART framing/handshake, the audio-return
+pipeline, PTT command order, language mapping, translation, CUDA fallback,
+temporary-file cleanup, and voice matching. The optional real Renode audio
+round-trip test is described in the root README.
 
 ## 9. Troubleshooting
 
@@ -256,12 +266,11 @@ and voice matching.
 
 ## 10. Manual checks still required
 
-These cannot be automated here and should be verified on the target
-machine:
+These should also be checked on the user's target machine:
 
-1. **Live firmware run**: `launch_renode.ps1` + `run.ps1 --self-check
-   --probe-uart` must print `handshake + PING/PONG OK`, then a real
-   hold-to-talk session must show `ACK:PTT:BEGIN` / `ACK:PTT:END`.
+1. **Microphone session**: launch Renode and RESTS, then hold-to-talk and
+   verify that the UI shows the relaying status followed by transcript and
+   translation. The automated Renode test covers a synthetic audio round-trip.
 2. **Model download & inference**: `download_models.py` on a machine with
    internet, then one transcription + one translation (GPU path if you
    have CUDA).

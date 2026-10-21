@@ -150,3 +150,23 @@ def test_commands_are_queued_fifo(device):
         assert device.commands.index("PING") > device.commands.index("PTT:BEGIN")
     finally:
         uart.close()
+
+
+def test_audio_is_sent_and_echoed_as_binary_frames(device):
+    import math
+
+    states, replies = ([], [])
+    uart = make_uart(device, states, replies)
+    samples = [0.3 * math.sin(2 * math.pi * 330 * i / 16_000) for i in range(2_100)]
+    try:
+        assert uart.connect()
+        returned = uart.relay_audio(samples, timeout=2.0)
+        assert len(returned) == len(samples)
+        assert wait_until(lambda: len(device.audio_frames) == 3)
+        assert [int.from_bytes(frame[3:5], "little") for frame in device.audio_frames] == [0, 1, 2]
+        assert all(frame.startswith(b"\xA5\x5A") for frame in device.audio_frames)
+        # The binary demultiplexer must leave the regular line protocol usable.
+        assert uart.send_command("PING")
+        assert wait_until(lambda: any(reply.line == "PONG" for reply in replies))
+    finally:
+        uart.close()

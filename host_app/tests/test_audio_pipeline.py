@@ -133,6 +133,61 @@ def test_pipeline_removes_temp_recording_when_asr_raises(tmp_path):
     assert list(tmp_path.glob("*.wav")) == []
 
 
+def test_pipeline_recognizes_audio_returned_by_relay(tmp_path):
+    import struct
+
+    class InspectingAsr(FakeAsr):
+        def transcribe(self, audio_path):
+            with wave.open(audio_path, "rb") as handle:
+                self.pcm = struct.unpack("<4h", handle.readframes(4))
+            return super().transcribe(audio_path)
+
+    asr = InspectingAsr(text="relayed voice", language="en")
+    service = TranslationService(PassthroughBackend())
+    source_samples = [0.0] * 4
+    relayed_samples = [0.25, -0.25, 0.5, -0.5]
+    seen = []
+
+    result = process_recording(
+        source_samples,
+        asr,
+        service,
+        language_by_key("en"),
+        language_by_key("en"),
+        sample_rate=16_000,
+        tmp_dir=tmp_path,
+        audio_relay=lambda samples: seen.append(list(samples)) or relayed_samples,
+    )
+
+    assert result.ok
+    assert seen == [source_samples]
+    assert asr.pcm == (8191, -8191, 16383, -16383)
+    assert list(tmp_path.glob("*.wav")) == []
+
+
+def test_pipeline_does_not_bypass_a_failed_audio_relay(tmp_path):
+    asr = FakeAsr()
+    service = TranslationService(PassthroughBackend())
+
+    def failed_relay(_samples):
+        raise RuntimeError("STM32 relay disconnected")
+
+    result = process_recording(
+        [0.1] * 8_000,
+        asr,
+        service,
+        language_by_key("en"),
+        language_by_key("hi"),
+        tmp_dir=tmp_path,
+        audio_relay=failed_relay,
+    )
+
+    assert result.ok is False
+    assert "STM32 relay disconnected" in result.error
+    assert asr.calls == 0
+    assert list(tmp_path.glob("*.wav")) == []
+
+
 def test_pipeline_keeps_source_caption_when_translation_unavailable(tmp_path):
     class ExplodingBackend(PassthroughBackend):
         name = "exploding"

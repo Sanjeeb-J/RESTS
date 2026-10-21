@@ -2,16 +2,17 @@
 
 RESTS is a local speech translation demonstration built around a Windows desktop application and an STM32F429 firmware project. Speak using push-to-talk, view the recognized speech and translated caption, and optionally hear the translation through an installed Windows voice. Renode emulates the microcontroller and connects to the desktop application through UART-over-TCP.
 
-> **Current scope:** Speech recognition and translation run on the laptop. The STM32 firmware demonstrates command handling and UART communication; it does not run the speech or translation models.
+> **Processing split:** The laptop captures and compresses the speech. The audio packets travel through Renode and the STM32F429 UART relay, then return to the laptop. Faster-Whisper and NLLB run on the laptop; the STM32 does not run the AI models.
 
 ## Features
 
 - Push-to-talk recording from a laptop microphone (button or **F9**).
 - Local speech recognition with Faster-Whisper and local translation with NLLB-200.
 - Source transcript and translated caption in the desktop UI.
-- Optional spoken output using installed Windows speech voices.
+- Spoken translation using a matching installed Windows speech voice; the app reports the voice used or explains when one is unavailable.
 - A 95-language source/target selection, plus automatic source-language detection.
-- STM32F429ZI firmware emulated in Renode, with interrupt-driven USART1 reception.
+- Compressed audio relay through Renode and interrupt-driven STM32F429ZI USART1 firmware.
+- CRC-checked, sequenced UART audio packets; existing PING and command acknowledgements remain available.
 - Local operation after model files are downloaded; no cloud translation service is used.
 
 ## Architecture
@@ -20,16 +21,16 @@ RESTS is a local speech translation demonstration built around a Windows desktop
 Laptop microphone
        │
        ▼
-RESTS Windows app ──► Faster-Whisper ──► source transcript
-       │                                      │
-       │                                      ▼
-       │                                  NLLB-200 ──► translated caption / optional voice
+RESTS host ──► ADPCM audio packets ──► TCP socket ──► Renode ──► STM32F429 USART1 relay
+       ▲                                                                    │
+       └──────────────────── relayed audio returns over UART/TCP ──────────┘
        │
-       └── UART commands over TCP ──► Renode ──► emulated STM32F429ZI firmware
-                                      127.0.0.1:12345
+       └──► Faster-Whisper ──► transcript ──► NLLB-200 ──► captions / optional voice
 ```
 
-The desktop app performs audio capture, recognition, translation, captions, and optional text-to-speech. The firmware receives session and language commands and returns acknowledgements. See [PROJECT_EXPLANATION.md](PROJECT_EXPLANATION.md) for the full workflow, key files, and protocol.
+The STM32 returns the framed audio packets; it does not recognize speech or translate text. Recognition, translation, captions, and optional text-to-speech happen on the laptop. Push-to-talk and language commands also use the UART link. See [PROJECT_EXPLANATION.md](PROJECT_EXPLANATION.md) for the full workflow, key files, and packet protocol.
+
+Spoken output uses Windows SAPI voices installed on the computer. Voice availability depends on the selected target language. In the verified Windows setup, English, Japanese, and Korean voices were detected; when a target has no matching voice, RESTS keeps the translated caption visible and reports that speech is unavailable.
 
 ## Requirements
 
@@ -75,7 +76,7 @@ In another PowerShell window, run:
 powershell -ExecutionPolicy Bypass -File host_app\run.ps1
 ```
 
-Choose the source and target languages, hold the on-screen talk button or **F9** while speaking, and release it to process the audio. Results appear in the source transcript and translated caption panels.
+Choose the source and target languages, hold the on-screen talk button or **F9** while speaking, and release it. The compressed audio travels through Renode and the STM32 relay before local recognition and translation. Results appear in the source transcript and translated caption panels. Keep Renode running for each recording.
 
 ## Checks and tests
 
@@ -95,6 +96,14 @@ Run the Renode UART protocol suite (requires Renode and a built Debug ELF):
 
 ```powershell
 renode-test.bat tests\renode_uart_protocol.robot
+```
+
+Run the real Renode audio round-trip test (starts and stops its own Renode instance):
+
+```powershell
+$env:RESTS_RUN_RENODE_TESTS = "1"
+host_app\.venv\Scripts\python.exe -m pytest host_app\tests\test_renode_audio_relay.py -q
+Remove-Item Env:\RESTS_RUN_RENODE_TESTS
 ```
 
 More setup details and troubleshooting are in [host_app/README.md](host_app/README.md).

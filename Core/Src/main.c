@@ -33,6 +33,13 @@
 /* USER CODE BEGIN PD */
 #define RESTS_RX_RING_SIZE 128U
 #define RESTS_COMMAND_SIZE 96U
+#define RESTS_AUDIO_MAGIC_0 0xA5U
+#define RESTS_AUDIO_MAGIC_1 0x5AU
+#define RESTS_AUDIO_TYPE 1U
+#define RESTS_AUDIO_HEADER_SIZE 7U
+#define RESTS_AUDIO_MAX_PAYLOAD 512U
+#define RESTS_AUDIO_FRAME_SIZE (RESTS_AUDIO_HEADER_SIZE + RESTS_AUDIO_MAX_PAYLOAD + 2U)
+#define RESTS_AUDIO_TIMEOUT_MS 2000U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -53,6 +60,12 @@ static volatile uint8_t usart1_rx_ring[RESTS_RX_RING_SIZE];
 static char rests_command[RESTS_COMMAND_SIZE];
 static uint16_t rests_command_length;
 static uint8_t rests_command_overflow;
+static uint8_t rests_audio_frame[RESTS_AUDIO_FRAME_SIZE];
+static uint16_t rests_audio_frame_length;
+static uint16_t rests_audio_expected_length;
+static uint32_t rests_audio_last_byte_tick;
+static uint8_t rests_audio_mode;
+static uint8_t rests_audio_magic_pending;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -63,6 +76,8 @@ static void MX_USART1_UART_Init(void);
 static void USART1_StartReceive(void);
 static void RESTS_ProcessRx(void);
 static void RESTS_ProcessByte(uint8_t byte);
+static void RESTS_ProcessCommandByte(uint8_t byte);
+static uint16_t RESTS_Crc16(const uint8_t *data, uint16_t length);
 static void RESTS_HandleCommand(const char *command);
 static void RESTS_Send(const char *message);
 /* USER CODE END PFP */
@@ -127,7 +142,31 @@ static void RESTS_HandleCommand(const char *command)
   }
 }
 
-static void RESTS_ProcessByte(uint8_t byte)
+static uint16_t RESTS_Crc16(const uint8_t *data, uint16_t length)
+{
+  uint16_t crc = 0xFFFFU;
+  uint16_t i;
+  uint8_t bit;
+
+  for (i = 0U; i < length; i++)
+  {
+    crc ^= (uint16_t)data[i] << 8;
+    for (bit = 0U; bit < 8U; bit++)
+    {
+      if ((crc & 0x8000U) != 0U)
+      {
+        crc = (uint16_t)((crc << 1) ^ 0x1021U);
+      }
+      else
+      {
+        crc = (uint16_t)(crc << 1);
+      }
+    }
+  }
+  return crc;
+}
+
+static void RESTS_ProcessCommandByte(uint8_t byte)
 {
   if ((byte == (uint8_t)'\r') || (byte == (uint8_t)'\n'))
   {
@@ -160,8 +199,106 @@ static void RESTS_ProcessByte(uint8_t byte)
   }
 }
 
+static void RESTS_ProcessByte(uint8_t byte)
+{
+  uint16_t payload_length;
+  uint16_t received_crc;
+  uint16_t calculated_crc;
+
+  if (rests_audio_mode == 0U)
+  {
+    if (rests_audio_magic_pending != 0U)
+    {
+      rests_audio_magic_pending = 0U;
+      if (byte == RESTS_AUDIO_MAGIC_1)
+      {
+        rests_audio_frame[0] = RESTS_AUDIO_MAGIC_0;
+        rests_audio_frame[1] = RESTS_AUDIO_MAGIC_1;
+        rests_audio_frame_length = 2U;
+        rests_audio_expected_length = 0U;
+        rests_audio_mode = 1U;
+        rests_audio_last_byte_tick = HAL_GetTick();
+        return;
+      }
+      RESTS_ProcessCommandByte(RESTS_AUDIO_MAGIC_0);
+    }
+
+    if (byte == RESTS_AUDIO_MAGIC_0)
+    {
+      rests_audio_magic_pending = 1U;
+      rests_audio_last_byte_tick = HAL_GetTick();
+      return;
+    }
+    RESTS_ProcessCommandByte(byte);
+    return;
+  }
+
+  rests_audio_last_byte_tick = HAL_GetTick();
+  if (rests_audio_frame_length < RESTS_AUDIO_FRAME_SIZE)
+  {
+    rests_audio_frame[rests_audio_frame_length++] = byte;
+  }
+  else
+  {
+    rests_audio_mode = 0U;
+    rests_audio_frame_length = 0U;
+    rests_audio_expected_length = 0U;
+    RESTS_Send("ERR:AUDIO_FRAME\r\n");
+    return;
+  }
+
+  if (rests_audio_frame_length == RESTS_AUDIO_HEADER_SIZE)
+  {
+    payload_length = (uint16_t)rests_audio_frame[5] |
+                     ((uint16_t)rests_audio_frame[6] << 8);
+    if ((rests_audio_frame[2] != RESTS_AUDIO_TYPE) ||
+        (payload_length == 0U) || (payload_length > RESTS_AUDIO_MAX_PAYLOAD))
+    {
+      rests_audio_mode = 0U;
+      rests_audio_frame_length = 0U;
+      rests_audio_expected_length = 0U;
+      RESTS_Send("ERR:AUDIO_HEADER\r\n");
+      return;
+    }
+    rests_audio_expected_length = RESTS_AUDIO_HEADER_SIZE + payload_length + 2U;
+  }
+
+  if ((rests_audio_expected_length != 0U) &&
+      (rests_audio_frame_length == rests_audio_expected_length))
+  {
+    received_crc = (uint16_t)rests_audio_frame[rests_audio_expected_length - 2U] |
+                   ((uint16_t)rests_audio_frame[rests_audio_expected_length - 1U] << 8);
+    calculated_crc = RESTS_Crc16(&rests_audio_frame[2],
+                                  (uint16_t)(rests_audio_expected_length - 4U));
+    if (received_crc == calculated_crc)
+    {
+      if (HAL_UART_Transmit(&huart1, rests_audio_frame,
+                            rests_audio_expected_length, 1000U) != HAL_OK)
+      {
+        usart1_error = 1U;
+      }
+    }
+    else
+    {
+      RESTS_Send("ERR:AUDIO_CRC\r\n");
+    }
+    rests_audio_mode = 0U;
+    rests_audio_frame_length = 0U;
+    rests_audio_expected_length = 0U;
+  }
+}
+
 static void RESTS_ProcessRx(void)
 {
+  if (((rests_audio_mode != 0U) || (rests_audio_magic_pending != 0U)) &&
+      ((HAL_GetTick() - rests_audio_last_byte_tick) > RESTS_AUDIO_TIMEOUT_MS))
+  {
+    rests_audio_mode = 0U;
+    rests_audio_magic_pending = 0U;
+    rests_audio_frame_length = 0U;
+    rests_audio_expected_length = 0U;
+  }
+
   if ((usart1_error != 0U) && (huart1.RxState == HAL_UART_STATE_READY))
   {
     usart1_error = 0U;
@@ -177,6 +314,10 @@ static void RESTS_ProcessRx(void)
 
     rests_command_length = 0U;
     rests_command_overflow = 0U;
+    rests_audio_mode = 0U;
+    rests_audio_magic_pending = 0U;
+    rests_audio_frame_length = 0U;
+    rests_audio_expected_length = 0U;
     RESTS_Send("ERR:RX_OVERFLOW\r\n");
   }
 

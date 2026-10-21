@@ -4,9 +4,9 @@
 
 RESTS is a speech translation demo. A person speaks into a laptop microphone. The Windows application recognizes the speech, translates it locally, and displays both the original words and the translation. If Windows has a suitable speech voice installed, the app can also read the translation aloud.
 
-An emulated STM32F429ZI microcontroller is part of the demonstration. It receives session and language commands from the desktop application and replies over UART. Renode provides the virtual STM32 board and connects its UART to the app through a local TCP socket.
+An emulated STM32F429ZI microcontroller is part of the audio route. The host compresses captured speech into small packets, sends them through Renode to firmware over USART1, and receives the relayed packets back through the same local connection. Renode provides the virtual STM32 board and connects its UART to the app through a TCP socket.
 
-**The laptop does the AI processing.** The STM32 firmware does not recognize or translate speech. Its role is to demonstrate embedded firmware, interrupt-based serial input, command parsing, and acknowledgements.
+**The laptop does the AI processing.** The STM32 firmware validates and relays compressed audio frames, and also handles control commands. It does not recognize or translate speech. Renode emulates the board; it is not the translation service.
 
 ## 2. Applications and tools
 
@@ -14,13 +14,13 @@ An emulated STM32F429ZI microcontroller is part of the demonstration. It receive
 |---|---|
 | STM32CubeIDE | Opens and builds the STM32F429 firmware project. |
 | STM32CubeMX configuration (`RESTS_STM32.ioc`) | Describes the microcontroller and peripheral configuration used by the firmware project. |
-| Renode | Emulates the STM32F429ZI board and exposes USART1 to the desktop app. |
-| Python desktop application | Captures speech, runs recognition and translation, displays captions, optionally speaks the translation, and sends UART commands. |
+| Renode | Emulates the STM32F429ZI board and bridges USART1 to the desktop app's local TCP connection. |
+| Python desktop application | Captures and compresses speech, sends it through the STM32 relay, runs recognition and translation on returned audio, displays captions, and optionally speaks the translation. |
 | Faster-Whisper | Converts the recorded speech into text on the laptop. |
 | NLLB-200 | Translates recognized text on the laptop. |
-| Windows SAPI voices | Optional local text-to-speech voices supplied by Windows. |
+| Windows SAPI voices | Local text-to-speech voices supplied by Windows; the selected target needs a matching voice. |
 
-After the model files are downloaded, recognition and translation are intended to run locally. The app does not send recordings to a cloud translation service. Renode's UART connection is local to the computer.
+After the model files are downloaded, recognition and translation run locally. The app does not send recordings to a cloud translation service. Renode's UART connection is local to the computer.
 
 ## 3. End-to-end workflow
 
@@ -29,9 +29,10 @@ After the model files are downloaded, recognition and translation are intended t
 3. Start the RESTS desktop application. It connects to Renode at `127.0.0.1:12345` and checks that the firmware responds.
 4. Select a source language or **Auto**, choose a target language, and optionally enable spoken output.
 5. Hold the **HOLD TO TALK** button or **F9**, speak into the laptop microphone, and release.
-6. The application sends the selected language and push-to-talk state to the firmware. In parallel, it processes the captured audio locally.
-7. Faster-Whisper produces a source transcript. NLLB-200 translates that text. The app displays the transcript and translated caption, then uses an installed Windows voice if spoken output is enabled and available.
-8. The firmware sends acknowledgements to the app. These demonstrate the UART path; they do not carry audio or translated text.
+6. The host encodes audio into compact IMA ADPCM blocks and sends sequenced, CRC-checked frames through TCP, Renode, and USART1.
+7. The STM32 checks each frame and relays it back through USART1 and Renode. The host verifies the response and rebuilds the audio samples.
+8. Faster-Whisper transcribes the returned audio. NLLB-200 translates the transcript. The app displays both captions and, when enabled, asks an installed matching Windows voice to speak the translation.
+9. Language and push-to-talk commands continue to use the text UART protocol; firmware acknowledgements remain available.
 
 ## 4. System flow
 
@@ -39,26 +40,32 @@ After the model files are downloaded, recognition and translation are intended t
 AUDIO / TRANSLATION
 Laptop microphone
     → push-to-talk recording
+    → IMA ADPCM audio blocks
+    → sequenced CRC-checked frames
+    → TCP socket → Renode → STM32F429 USART1 relay
+    → returned frames → host audio reconstruction
     → Faster-Whisper speech recognition
-    → source transcript
-    → NLLB-200 translation
-    → translated caption
-    → optional Windows voice
+    → source transcript → NLLB-200 translation
+    → translated caption → Windows SAPI voice → laptop speaker (if installed)
 
 MICROCONTROLLER / UART
 RESTS desktop app
     → TCP socket (127.0.0.1:12345)
     → Renode STM32F429ZI emulation
-    → emulated USART1
-    → firmware interrupt receiver and command parser
-    → acknowledgement returned along the same path
+    → USART1 interrupt receiver
+    → CRC-checked audio frame relay
+    → returned frame over USART1 / Renode / TCP
+    → host verifies sequence and checksum, then decodes audio
+
+Control messages (HELLO?, PING, LANG, PTT) share the same link and retain
+their newline-delimited command/reply format.
 ```
 
-The two paths are connected by the desktop application, but speech audio and model inference stay on the laptop. UART messages are short control commands.
+The captured voice follows the UART route before speech recognition. Models still execute on the laptop, and translated text goes directly from the laptop to both the display and (when a matching Windows voice is installed) text-to-speech. The computer used for verification detected English, Japanese, and Korean Windows voices. Hindi and Malayalam still display translated captions, but no matching SAPI voice was installed on that computer.
 
 ## 5. UART protocol in plain language
 
-The app and firmware exchange newline-terminated text commands over USART1. Renode bridges USART1 to TCP, allowing the Windows app to connect as a normal TCP client.
+The app and firmware exchange newline-terminated text commands and binary audio frames over USART1. Renode bridges USART1 to TCP. Audio frames contain magic bytes, type, sequence, length, payload, and CRC-16/CCITT-FALSE. The host encodes 16-bit samples into independent IMA ADPCM blocks; the firmware validates and returns each frame unchanged.
 
 | Message | Meaning | Typical firmware response |
 |---|---|---|
@@ -67,6 +74,7 @@ The app and firmware exchange newline-terminated text commands over USART1. Reno
 | `LANG:<source>:<target>` | Reports the selected source and target language tokens. | An `ACK` response or an error. |
 | `PTT:BEGIN` | Push-to-talk recording has started. | An `ACK` response. |
 | `PTT:END` | Push-to-talk recording has ended. | An `ACK` response. |
+| Binary audio frame | Compressed audio block with sequence and CRC. | The same frame is relayed back; no text acknowledgement is needed. |
 
 For example, `LANG:en:ml` indicates English as the selected source and Malayalam as the target. If source is **Auto**, the app sends `auto` at the time the button is pressed; the actual language is detected from the recording afterward.
 
@@ -74,7 +82,7 @@ For example, `LANG:en:ml` indicates English as the selected source and Malayalam
 
 ### Firmware and board configuration
 
-- `Core/Src/main.c` — firmware startup and main loop, USART1 setup, command handling, and protocol responses. Generated-code regions are marked with CubeMX `USER CODE` comments.
+- `Core/Src/main.c` — firmware startup and main loop, USART1 interrupt receive, command handling, audio frame validation/relay, and text responses. Generated-code regions are marked with CubeMX `USER CODE` comments.
 - `Core/Src/stm32f4xx_it.c` — interrupt handlers, including the USART interrupt entry point.
 - `Core/Inc/` — firmware headers and generated peripheral declarations.
 - `Drivers/` — CMSIS device/core headers and STM32F4 HAL implementation.
@@ -84,14 +92,15 @@ For example, `LANG:en:ml` indicates English as the selected source and Malayalam
 
 ### Host application
 
-- `host_app/rests_host/app.py` — Tkinter user interface and user interaction.
+- `host_app/rests_host/app.py` — Tkinter user interface and user interaction; `_job_worker()` calls text-to-speech after a successful translation and displays speech errors or the voice used.
 - `host_app/rests_host/audio.py` — microphone recording and audio handling.
+- `host_app/rests_host/audio_transport.py` — IMA ADPCM codec, binary frame/CRC handling, and audio round-trip coordination.
 - `host_app/rests_host/ptt.py` — push-to-talk state and coordination.
 - `host_app/rests_host/asr.py` — local Faster-Whisper recognition and CPU/CUDA device handling.
 - `host_app/rests_host/translate.py` — local translation backend and NLLB integration.
 - `host_app/rests_host/languages.py` — language labels and model language codes.
-- `host_app/rests_host/tts.py` — optional Windows speech voice selection and output.
-- `host_app/rests_host/uart.py` — socket connection, line framing, handshake, and UART command exchange.
+- `host_app/rests_host/tts.py` — Windows SAPI voice matching and spoken output via `WindowsSpeech.speak()`.
+- `host_app/rests_host/uart.py` — socket connection, command/binary frame demultiplexing, handshake, and sequenced audio exchange.
 - `host_app/rests_host/pipeline.py` — coordinates audio, recognition, translation, and results.
 - `host_app/rests_host/config.py` — application settings and environment-based overrides.
 - `host_app/rests_host/selfcheck.py` — model, voice, and optional UART diagnostics.
@@ -110,7 +119,7 @@ For example, `LANG:en:ml` indicates English as the selected source and Malayalam
 
 The language selector offers 95 languages supported by both the speech-recognition model and the translation model. The source selector also offers **Auto**. Model language support does not guarantee equal translation quality for every language pair.
 
-Speech output depends on Windows SAPI voices installed on the computer. If a target language has no matching installed voice, the app still displays the translated caption and reports that speech output is unavailable for that language.
+Speech output depends on Windows SAPI voices installed on the computer. The app reports the selected voice before a recording and the voice used after speaking; speech errors are shown in the UI instead of being silently swallowed. On the verified computer, the detected spoken targets were English, Japanese, and Korean. Hindi and Malayalam still work as translated captions, but a matching Windows SAPI voice was not installed. The available targets can differ between Windows computers.
 
 The app can use CUDA when the required runtime is available. In automatic mode, a CUDA runtime failure can fall back to CPU. CPU mode is also available when there is no supported GPU/runtime.
 
@@ -118,7 +127,7 @@ The app can use CUDA when the required runtime is available. In automatic mode, 
 
 The default NLLB-200 translation model is licensed **CC-BY-NC 4.0 (Attribution-NonCommercial)**. This is a non-commercial-use restriction. Check the original model licence before distributing or using the project in a commercial setting. Downloaded weights are stored locally and are excluded from Git.
 
-The emulated MCU demonstrates UART control and acknowledgement behavior. It does not process microphone audio, run neural-network inference, or perform translation. The real-time speech pipeline is implemented on the laptop.
+The emulated MCU relays compressed speech frames but does not perform recognition, run neural-network inference, or translate text. Speech and translation models run on the laptop; voice packets return from the emulated MCU before recognition.
 
 ## 9. Short demonstration sequence
 
@@ -126,5 +135,5 @@ The emulated MCU demonstrates UART control and acknowledgement behavior. It does
 2. Show Renode running the STM32F429ZI firmware.
 3. Start the RESTS desktop app and show the connected/ready state.
 4. Choose a source and target language, hold **HOLD TO TALK** or **F9**, say a short sentence, and release.
-5. Show the source transcript, translated caption, and optional spoken output.
-6. Explain that UART acknowledgements demonstrate the host-to-firmware communication, while the laptop performs speech recognition and translation.
+5. Select a target with an installed voice (English, Japanese, or Korean on the verified computer), enable **Spoken output**, and show the source transcript, translated caption, and audible spoken translation.
+6. Explain that voice packets cross USART1 and return through Renode before Faster-Whisper processes them; NLLB translation, captions, and text-to-speech remain on the laptop.

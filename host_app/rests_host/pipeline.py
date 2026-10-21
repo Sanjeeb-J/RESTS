@@ -11,7 +11,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
 from .asr import AsrEngine
 from .audio import (
@@ -61,13 +61,19 @@ def process_recording(
     *,
     sample_rate: int = DEFAULT_SAMPLE_RATE,
     tmp_dir: Optional[Path] = None,
+    audio_relay: Optional[Callable[[Sequence[float]], Sequence[float]]] = None,
 ) -> ProcessingResult:
     """Run one full job. Always removes the temporary recording."""
     directory = Path(tmp_dir) if tmp_dir else temp_recording_dir()
     path = directory / f"rests_{int(time.time())}_{uuid.uuid4().hex[:8]}.wav"
     started = time.monotonic()
     try:
-        write_wav(path, samples, sample_rate)
+        # When configured by the app, speech recognition must use the audio
+        # that completed the Renode/STM32 UART round-trip.
+        model_samples = audio_relay(samples) if audio_relay is not None else samples
+        if len(model_samples) == 0:
+            raise RuntimeError("the STM32 audio relay returned no audio samples")
+        write_wav(path, model_samples, sample_rate)
         transcript = asr.transcribe(str(path))
         duration = recording_seconds(len(samples), sample_rate)
         if not transcript.ok:

@@ -19,3 +19,5 @@ host_app/tmp/
 __pycache__/
 *.pyc
 .pytest_cache/
+
+DEMO_PRESENTATION_SCRIPT.md

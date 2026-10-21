@@ -47,6 +47,7 @@ class FakeRestsDevice:
         self.close_after_first_command = close_after_first_command
         self.commands: List[str] = []
         self.frames: List[bytes] = []
+        self.audio_frames: List[bytes] = []
         self.raw = bytearray()
         self._closed = threading.Event()
         self._lock = threading.Lock()
@@ -72,7 +73,7 @@ class FakeRestsDevice:
             handler.start()
 
     def _handle(self, conn: socket.socket) -> None:
-        buffer = b""
+        buffer = bytearray()
         try:
             while not self._closed.is_set():
                 chunk = conn.recv(4096)
@@ -81,8 +82,38 @@ class FakeRestsDevice:
                 with self._lock:
                     self.raw += chunk
                 buffer += chunk
-                while b"\n" in buffer:
-                    raw_frame, buffer = buffer.split(b"\n", 1)
+                while buffer:
+                    if buffer.startswith(b"\xA5\x5A"):
+                        if len(buffer) < 7:
+                            break
+                        payload_length = int.from_bytes(buffer[5:7], "little")
+                        total = 7 + payload_length + 2
+                        if payload_length == 0 or payload_length > 512:
+                            del buffer[:1]
+                            continue
+                        if len(buffer) < total:
+                            break
+                        frame = bytes(buffer[:total])
+                        del buffer[:total]
+                        with self._lock:
+                            self.audio_frames.append(frame)
+                        try:
+                            conn.sendall(frame)
+                        except OSError:
+                            return
+                        continue
+                    newline = buffer.find(b"\n")
+                    marker = buffer.find(b"\xA5\x5A")
+                    if newline < 0:
+                        if marker > 0:
+                            del buffer[:marker]
+                            continue
+                        break
+                    if marker >= 0 and marker < newline:
+                        del buffer[:marker]
+                        continue
+                    raw_frame = bytes(buffer[:newline])
+                    del buffer[: newline + 1]
                     frame = raw_frame + b"\n"
                     self._record(frame)
                     reply = self._reply_for(raw_frame)
